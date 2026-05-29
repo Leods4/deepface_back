@@ -1,16 +1,37 @@
 import os
 import re
-import shutil
+import tempfile
 import uuid
+import shutil
+import numpy as np
 import uvicorn
-import threading
 from typing import List
-from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from deepface import DeepFace
 
-app = FastAPI(title="API de Reconhecimento Facial e de Tatuagens")
+# --- Configurações do Banco Vetorial (ChromaDB) ---
+import chromadb
+from chromadb.config import Settings
+
+# Inicializa o ChromaDB para salvar os dados localmente na pasta "./chroma_db"
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+
+# Cria ou carrega as coleções de vetores. A métrica "cosine" é ideal para biometria.
+colecao_rostos = chroma_client.get_or_create_collection(
+    name="rostos", metadata={"hnsw:space": "cosine"}
+)
+colecao_tatuagens = chroma_client.get_or_create_collection(
+    name="tatuagens", metadata={"hnsw:space": "cosine"}
+)
+
+# Diretório local para salvar as imagens (substituindo o BYTEA do PostgreSQL)
+DIR_IMAGENS = "./banco_imagens"
+os.makedirs(os.path.join(DIR_IMAGENS, "rostos"), exist_ok=True)
+os.makedirs(os.path.join(DIR_IMAGENS, "tatuagens"), exist_ok=True)
+
+# --- Configurações da API ---
+app = FastAPI(title="API de Biometria (Otimizada com ChromaDB)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,39 +41,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = "fotos"
-TATTOO_DIR = "tatuagens"
 MAX_IMAGES_PER_REQUEST = 5
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/jpg"}
 
-# Lock para evitar concorrência de leitura/escrita no cache do DeepFace
-db_lock = threading.Lock()
+# --- Funções Auxiliares Matemáticas e de Modelo ---
 
-os.makedirs(BASE_DIR, exist_ok=True)
-os.makedirs(TATTOO_DIR, exist_ok=True)
-
-# Modelo para Tatuagens (Instanciado de forma preguiçosa/lazy load para não pesar o startup)
 modelo_tatuagem = None
 
 def carregar_modelo_tatuagem():
-    """Carrega um extrator de características leve baseado em MobileNetV2."""
     global modelo_tatuagem
     if modelo_tatuagem is None:
-        from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2
+        from tensorflow.keras.applications import EfficientNetB0
         from tensorflow.keras.models import Model
         from tensorflow.keras.layers import GlobalAveragePooling2D
         
-        # Carrega o modelo pré-treinado na ImageNet sem a camada de classificação final
-        base = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+        base = EfficientNetB0(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
         x = GlobalAveragePooling2D()(base.output)
         modelo_tatuagem = Model(inputs=base.input, outputs=x)
     return modelo_tatuagem
 
 def extrair_vetor_tatuagem(caminho_imagem: str):
-    """Gera um vetor numérico normalizado representando as texturas/formas da imagem."""
-    import numpy as np
     from tensorflow.keras.preprocessing import image as keras_image
-    from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+    from tensorflow.keras.applications.efficientnet import preprocess_input
 
     model = carregar_modelo_tatuagem()
     img = keras_image.load_img(caminho_imagem, target_size=(224, 224))
@@ -61,208 +71,181 @@ def extrair_vetor_tatuagem(caminho_imagem: str):
     x = preprocess_input(x)
     
     embedding = model.predict(x, verbose=0)[0]
+    
     norma = np.linalg.norm(embedding)
-    return embedding / norma if norma > 0 else embedding
+    vetor_normalizado = embedding / norma if norma > 0 else embedding
+    return vetor_normalizado.tolist()
 
-def buscar_tatuagem_proxima(caminho_query: str, threshold: float = 0.5):
-    """Compara o vetor da imagem enviada com todas as tatuagens salvas no banco."""
-    import numpy as np
-    vetor_query = extrair_vetor_tatuagem(caminho_query)
-    
-    melhor_usuario = None
-    melhor_distancia = float('inf')
-    melhor_caminho = None
-    
-    for raiz, _, arquivos in os.walk(TATTOO_DIR):
-        for arquivo in arquivos:
-            ext = arquivo.split('.')[-1].lower()
-            if ext in ['jpg', 'jpeg', 'png']:
-                caminho_db = os.path.join(raiz, arquivo)
-                try:
-                    vetor_db = extrair_vetor_tatuagem(caminho_db)
-                    # Distância de Cosseno: 1.0 - Produto Escalar (vetores já normalizados)
-                    distancia = 1.0 - float(np.dot(vetor_query, vetor_db))
-                    
-                    if distancia < melhor_distancia:
-                        melhor_distancia = distancia
-                        melhor_caminho = caminho_db
-                        melhor_usuario = Path(caminho_db).parent.name
-                except Exception as e:
-                    print(f"Erro ao processar vetor da imagem {caminho_db}: {e}")
-                    
-    if melhor_usuario and melhor_distancia <= threshold:
-        return melhor_usuario, melhor_distancia, melhor_caminho.replace('\\', '/')
-    return None, None, None
-
-def sanitizar_nome_pasta(nome: str) -> str:
-    """Remove caracteres especiais e espaços para evitar Path Traversal."""
+def sanitizar_nome(nome: str) -> str:
     nome_limpo = re.sub(r'[^a-zA-Z0-9_-]', '', nome.replace(" ", "_"))
     if not nome_limpo:
         raise ValueError("Nome inválido.")
     return nome_limpo
 
-def limpar_cache_deepface():
-    """Remove os arquivos .pkl para forçar o DeepFace a reindexar as imagens."""
-    for item in os.listdir(BASE_DIR):
-        if item.endswith(".pkl"):
-            try:
-                os.remove(os.path.join(BASE_DIR, item))
-            except Exception as e:
-                print(f"Erro ao remover arquivo de cache {item}: {e}")
+def salvar_temporario(file: UploadFile) -> str:
+    extensao = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{extensao}") as tmp:
+        tmp.write(file.file.read())
+        file.file.seek(0) 
+        return tmp.name
 
 # ==================== ROTAS DE ROSTO (DEEPFACE) ====================
 
 @app.post("/api/cadastrar")
 def cadastrar_usuario(files: List[UploadFile] = File(...), nome: str = Form(...)):
     if len(files) > MAX_IMAGES_PER_REQUEST:
-        raise HTTPException(status_code=400, detail=f"O limite máximo é de {MAX_IMAGES_PER_REQUEST} imagens.")
-    if not nome or not nome.strip():
-        raise HTTPException(status_code=400, detail="Nome não fornecido.")
-
+        raise HTTPException(status_code=400, detail=f"Limite de {MAX_IMAGES_PER_REQUEST} imagens.")
     try:
-        nome_pasta = sanitizar_nome_pasta(nome)
+        nome_sanitizado = sanitizar_nome(nome)
     except ValueError:
-        raise HTTPException(status_code=400, detail="O nome fornecido contém caracteres inválidos.")
+        raise HTTPException(status_code=400, detail="Nome inválido.")
 
-    caminho_pasta = os.path.join(BASE_DIR, nome_pasta)
-    os.makedirs(caminho_pasta, exist_ok=True)
     resultados = []
-
     for file in files:
         if file.content_type not in ALLOWED_CONTENT_TYPES:
-            resultados.append({"arquivo": file.filename, "status": "erro", "mensagem": "Formato não suportado."})
             continue
         
-        extensao = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-        nome_arquivo_unico = f"{uuid.uuid4().hex}.{extensao}"
-        caminho_destino = os.path.join(caminho_pasta, nome_arquivo_unico)
+        caminho_tmp = salvar_temporario(file)
         
         try:
-            with open(caminho_destino, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            resultados.append({"arquivo": file.filename, "status": "sucesso", "mensagem": f"Salvo com sucesso para o usuário '{nome_pasta}'."})
-        except Exception:
-            resultados.append({"arquivo": file.filename, "status": "erro", "mensagem": "Erro ao salvar arquivo na API."})
+            # Extrai o vetor
+            representacoes = DeepFace.represent(img_path=caminho_tmp, model_name="ArcFace", enforce_detection=False)
+            vetor_rosto = representacoes[0]["embedding"]
+            
+            # Salva a imagem fisicamente no disco
+            id_unico = str(uuid.uuid4())
+            extensao = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+            caminho_final = os.path.join(DIR_IMAGENS, "rostos", f"{nome_sanitizado}_{id_unico}.{extensao}")
+            shutil.copy2(caminho_tmp, caminho_final)
+            
+            # Salva o vetor e os metadados no ChromaDB
+            colecao_rostos.add(
+                embeddings=[vetor_rosto],
+                metadatas=[{"nome_usuario": nome_sanitizado, "caminho_imagem": caminho_final}],
+                ids=[id_unico]
+            )
+            
+            resultados.append({"arquivo": file.filename, "status": "sucesso"})
+        except Exception as e:
+            resultados.append({"arquivo": file.filename, "status": "erro", "mensagem": str(e)})
+        finally:
+            os.remove(caminho_tmp)
 
-    with db_lock:
-        limpar_cache_deepface()
     return {"resultados": resultados}
 
 @app.post("/api/reconhecer")
 def reconhecer_imagens(files: List[UploadFile] = File(...)):
-    if len(files) > MAX_IMAGES_PER_REQUEST:
-        raise HTTPException(status_code=400, detail=f"O limite máximo é de {MAX_IMAGES_PER_REQUEST} imagens.")
-
+    # No ChromaDB, a distância de Cosseno vai de 0.0 (idêntico) a 1.0 (diferente)
+    THRESHOLD_ARCFACE = 0.68 
     resultados = []
+
+    # Verifica se a coleção está vazia
+    if colecao_rostos.count() == 0:
+        return {"resultados": [{"arquivo": f.filename, "status": "falha", "mensagem": "Banco vazio."} for f in files]}
+
     for file in files:
-        if file.content_type not in ALLOWED_CONTENT_TYPES:
-            resultados.append({"arquivo": file.filename, "status": "erro", "mensagem": "Formato não suportado."})
-            continue
-
-        extensao = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-        caminho_temporario = f"temp_{uuid.uuid4().hex}.{extensao}"
-        
+        caminho_tmp = salvar_temporario(file)
         try:
-            with open(caminho_temporario, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
+            representacoes = DeepFace.represent(img_path=caminho_tmp, model_name="ArcFace", enforce_detection=True)
+            vetor_query = representacoes[0]["embedding"]
             
-            with db_lock:
-                resultado = DeepFace.find(img_path=caminho_temporario, db_path=BASE_DIR, model_name="VGG-Face", enforce_detection=True, silent=True)
+            # Busca NATIVA do ChromaDB (Ultra Rápida)
+            resultado_busca = colecao_rostos.query(
+                query_embeddings=[vetor_query],
+                n_results=1 # Traz apenas o mais próximo
+            )
             
-            if len(resultado) > 0 and not resultado[0].empty:
-                df_resultado = resultado[0]
-                arquivo_encontrado = df_resultado['identity'][0]
-                valor_confianca = float(df_resultado['distance'][0] if 'distance' in df_resultado.columns else df_resultado.iloc[0, -1])
-                caminho_completo = str(arquivo_encontrado).replace('\\', '/')
-                nome_identificado = Path(caminho_completo).parent.name
-
+            distancia = resultado_busca['distances'][0][0]
+            
+            if distancia <= THRESHOLD_ARCFACE:
+                nome_identificado = resultado_busca['metadatas'][0][0]['nome_usuario']
                 resultados.append({
-                    "arquivo": file.filename, "status": "sucesso", "nome_identificado": nome_identificado,
-                    "caminho_imagem": caminho_completo, "distancia": round(valor_confianca, 4)
+                    "arquivo": file.filename, 
+                    "status": "sucesso", 
+                    "nome_identificado": nome_identificado, 
+                    "distancia": round(distancia, 4)
                 })
             else:
-                resultados.append({"arquivo": file.filename, "status": "falha", "mensagem": "Nenhuma correspondência facial encontrada."})
-        except ValueError: 
-            resultados.append({"arquivo": file.filename, "status": "erro", "mensagem": "Nenhum rosto detectado na imagem."})
-        except Exception as e:
-            resultados.append({"arquivo": file.filename, "status": "erro", "mensagem": "Erro interno durante o reconhecimento."})
-            print(f"Erro no DeepFace: {e}") 
-        finally:
-            if os.path.exists(caminho_temporario):
-                os.remove(caminho_temporario)
+                resultados.append({"arquivo": file.filename, "status": "falha", "mensagem": "Sem correspondência."})
                 
+        except Exception as e:
+            resultados.append({"arquivo": file.filename, "status": "erro", "mensagem": str(e)})
+        finally:
+            os.remove(caminho_tmp)
+            
     return {"resultados": resultados}
 
-# ==================== ROTAS DE TATUAGEM (MOBILENETV2) ====================
+# ==================== ROTAS DE TATUAGEM (EFFICIENTNET) ====================
 
 @app.post("/api/cadastrar-tatuagem")
 def cadastrar_tatuagem(files: List[UploadFile] = File(...), nome: str = Form(...)):
-    if len(files) > MAX_IMAGES_PER_REQUEST:
-        raise HTTPException(status_code=400, detail=f"O limite máximo é de {MAX_IMAGES_PER_REQUEST} imagens.")
-    if not nome or not nome.strip():
-        raise HTTPException(status_code=400, detail="Nome não fornecido.")
-
     try:
-        nome_pasta = sanitizar_nome_pasta(nome)
+        nome_sanitizado = sanitizar_nome(nome)
     except ValueError:
-        raise HTTPException(status_code=400, detail="O nome fornecido contém caracteres inválidos.")
+        raise HTTPException(status_code=400, detail="Nome inválido.")
 
-    caminho_pasta = os.path.join(TATTOO_DIR, nome_pasta)
-    os.makedirs(caminho_pasta, exist_ok=True)
     resultados = []
-
     for file in files:
-        if file.content_type not in ALLOWED_CONTENT_TYPES:
-            resultados.append({"arquivo": file.filename, "status": "erro", "mensagem": "Formato não suportado."})
-            continue
-        
-        extensao = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-        nome_arquivo_unico = f"{uuid.uuid4().hex}.{extensao}"
-        caminho_destino = os.path.join(caminho_pasta, nome_arquivo_unico)
+        caminho_tmp = salvar_temporario(file)
         
         try:
-            with open(caminho_destino, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            resultados.append({"arquivo": file.filename, "status": "sucesso", "mensagem": f"Tatuagem salva com sucesso para o usuário '{nome_pasta}'."})
-        except Exception:
-            resultados.append({"arquivo": file.filename, "status": "erro", "mensagem": "Erro ao salvar tatuagem na API."})
+            vetor_tattoo = extrair_vetor_tatuagem(caminho_tmp)
+            
+            id_unico = str(uuid.uuid4())
+            extensao = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+            caminho_final = os.path.join(DIR_IMAGENS, "tatuagens", f"{nome_sanitizado}_{id_unico}.{extensao}")
+            shutil.copy2(caminho_tmp, caminho_final)
+            
+            colecao_tatuagens.add(
+                embeddings=[vetor_tattoo],
+                metadatas=[{"nome_usuario": nome_sanitizado, "caminho_imagem": caminho_final}],
+                ids=[id_unico]
+            )
+            
+            resultados.append({"arquivo": file.filename, "status": "sucesso"})
+        except Exception as e:
+            resultados.append({"arquivo": file.filename, "status": "erro", "mensagem": str(e)})
+        finally:
+            os.remove(caminho_tmp)
 
     return {"resultados": resultados}
 
 @app.post("/api/reconhecer-tatuagem")
 def reconhecer_tatuagem(files: List[UploadFile] = File(...)):
-    if len(files) > MAX_IMAGES_PER_REQUEST:
-        raise HTTPException(status_code=400, detail=f"O limite máximo é de {MAX_IMAGES_PER_REQUEST} imagens.")
-
+    THRESHOLD_TATTOO = 0.4 
     resultados = []
-    for file in files:
-        if file.content_type not in ALLOWED_CONTENT_TYPES:
-            resultados.append({"arquivo": file.filename, "status": "erro", "mensagem": "Formato não suportado."})
-            continue
 
-        extensao = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-        caminho_temporario = f"temp_tattoo_{uuid.uuid4().hex}.{extensao}"
-        
+    if colecao_tatuagens.count() == 0:
+        return {"resultados": [{"arquivo": f.filename, "status": "falha", "mensagem": "Banco vazio."} for f in files]}
+
+    for file in files:
+        caminho_tmp = salvar_temporario(file)
         try:
-            with open(caminho_temporario, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
+            vetor_query = extrair_vetor_tatuagem(caminho_tmp)
             
-            nome_identificado, distancia, caminho_completo = buscar_tatuagem_proxima(caminho_temporario)
+            resultado_busca = colecao_tatuagens.query(
+                query_embeddings=[vetor_query],
+                n_results=1
+            )
             
-            if nome_identificado:
+            distancia = resultado_busca['distances'][0][0]
+            
+            if distancia <= THRESHOLD_TATTOO:
+                nome_identificado = resultado_busca['metadatas'][0][0]['nome_usuario']
                 resultados.append({
-                    "arquivo": file.filename, "status": "sucesso", "nome_identificado": nome_identificado,
-                    "caminho_imagem": caminho_completo, "distancia": round(distancia, 4)
+                    "arquivo": file.filename, 
+                    "status": "sucesso", 
+                    "nome_identificado": nome_identificado, 
+                    "distancia": round(distancia, 4)
                 })
             else:
-                resultados.append({"arquivo": file.filename, "status": "falha", "mensagem": "Nenhuma correspondência de tatuagem encontrada."})
-        except Exception as e:
-            resultados.append({"arquivo": file.filename, "status": "erro", "mensagem": "Erro ao processar análise da tatuagem."})
-            print(f"Erro no Reconhecimento de Tatuagem: {e}")
-        finally:
-            if os.path.exists(caminho_temporario):
-                os.remove(caminho_temporario)
+                resultados.append({"arquivo": file.filename, "status": "falha", "mensagem": "Sem correspondência."})
                 
+        except Exception as e:
+            resultados.append({"arquivo": file.filename, "status": "erro", "mensagem": str(e)})
+        finally:
+            os.remove(caminho_tmp)
+            
     return {"resultados": resultados}
 
 if __name__ == "__main__":
