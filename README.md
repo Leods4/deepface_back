@@ -1,116 +1,129 @@
-# Documentação da API de Biometria (Facial e Tatuagens)
+# 🧬 API de Biometria (Otimizada com ChromaDB)
 
-Esta é uma API RESTful de alto desempenho desenvolvida em **Python** utilizando **FastAPI**. Ela permite o cadastro e o reconhecimento biométrico de usuários através de análise facial e de tatuagens, utilizando redes neurais avançadas e um banco de dados vetorial local (ChromaDB) para buscas em milissegundos.
-
-## 🛠 Tecnologias Utilizadas
-
-* **FastAPI:** Framework web principal para roteamento e endpoints.
-* **ChromaDB:** Banco de dados vetorial (*Vector Database*) para armazenamento local e busca por similaridade (Distância de Cosseno).
-* **DeepFace (ArcFace):** Modelo de estado da arte para extração de características faciais (vetores de 512 dimensões).
-* **TensorFlow / EfficientNetB0:** Modelo de visão computacional para extração de características de tatuagens (vetores de 1280 dimensões).
-* **Uvicorn:** Servidor ASGI para rodar a aplicação.
+Uma API RESTful construída com **FastAPI** para reconhecimento biométrico avançado. O sistema realiza a extração e comparação de características físicas (rostos e tatuagens) utilizando modelos de Inteligência Artificial e armazena os embeddings (vetores) em um banco de dados vetorial de alta performance (**ChromaDB**).
 
 ---
 
-## ⚙️ Instalação e Configuração
+## 🚀 Recursos
+
+* **Reconhecimento Facial:** Utiliza a biblioteca `DeepFace` (modelo ArcFace) para extrair e comparar características faciais com alta precisão.
+* **Reconhecimento de Tatuagens:** Implementa um modelo `EfficientNetB0` (via TensorFlow/Keras) adaptado para extrair vetores de imagens de tatuagens.
+* **Busca Vetorial Ultra Rápida:** Integração com `ChromaDB` usando a métrica de distância de Cosseno, garantindo buscas instantâneas mesmo com grandes volumes de dados.
+* **Armazenamento Local:** Salva fisicamente as imagens cadastradas de forma organizada, referenciando-as nos metadados do banco vetorial.
+* **Arquitetura Modular:** Estrutura baseada em um padrão MVC informal para facilitar a manutenção e escalabilidade.
+
+---
+
+## 📂 Estrutura do Projeto
+
+O projeto adota uma arquitetura modularizada, separando as responsabilidades de inicialização, regras de negócio, IA e banco de dados:
+
+```text
+meu_projeto/
+│
+├── run.py                    # Ponto de entrada (inicia o servidor Uvicorn)
+├── chroma_db/                # (Gerado automaticamente) Banco de dados vetorial local
+├── banco_imagens/            # (Gerado automaticamente) Imagens salvas (rostos e tatuagens)
+│
+└── app/
+    ├── __init__.py           
+    ├── models.py             # Configuração do ChromaDB e diretórios de dados
+    ├── routes.py             # Instância do FastAPI e definição dos Endpoints (Controllers)
+    │
+    └── services/
+        ├── __init__.py
+        ├── utils.py          # Funções auxiliares (sanitização, arquivos temporários)
+        └── vision.py         # Lógica pesada de IA (Modelos TensorFlow/EfficientNet)
+```
+
+---
+
+## 🛠️ Tecnologias Utilizadas
+
+* **[FastAPI](https://fastapi.tiangolo.com/):** Framework web rápido para construção da API.
+* **[Uvicorn](https://www.uvicorn.org/):** Servidor ASGI para rodar a aplicação.
+* **[ChromaDB](https://www.trychroma.com/):** Banco de dados de vetores (Vector Database) operando de forma persistente local.
+* **[DeepFace](https://github.com/serengil/deepface):** Framework focado em reconhecimento facial.
+* **[TensorFlow / Keras](https://www.tensorflow.org/):** Para o modelo de extração de características de tatuagens (EfficientNet).
+* **[NumPy](https://numpy.org/):** Operações matemáticas e normalização de vetores.
+
+---
+
+## ⚙️ Instalação e Execução
 
 ### 1. Pré-requisitos
-Certifique-se de ter o Python 3.8+ instalado. É recomendável o uso de um ambiente virtual (`venv`).
+Recomenda-se o uso de **Python 3.9 a 3.11**. Certifique-se de ter o `pip` atualizado.
 
-### 2. Instalação das Dependências
-Execute o comando abaixo no terminal para instalar todas as bibliotecas necessárias:
-
-```bash
-pip install fastapi uvicorn python-multipart deepface chromadb tensorflow numpy
-```
-*(Nota: O `python-multipart` é essencial para que o FastAPI consiga receber formulários e arquivos de imagem via requisições POST).*
-
-### 3. Executando o Servidor
-Para iniciar a API em modo de desenvolvimento (com *reload* automático), execute:
+### 2. Clonar e preparar o ambiente
+Crie um ambiente virtual para isolar as dependências pesadas de IA:
 
 ```bash
-uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+# Criar o ambiente virtual
+python -m venv venv
+
+# Ativar o ambiente (Windows)
+venv\Scripts\activate
+# Ativar o ambiente (Linux/Mac)
+source venv/bin/activate
 ```
 
-A documentação interativa (Swagger UI) estará disponível automaticamente em: **http://127.0.0.1:8000/docs**
+### 3. Instalar Dependências
+Você precisará instalar os pacotes principais do projeto:
+
+```bash
+pip install fastapi uvicorn python-multipart chromadb deepface tensorflow numpy
+```
+
+*(Nota: Na primeira execução, o DeepFace e o Keras baixarão os pesos dos modelos `ArcFace` e `EfficientNet` automaticamente).*
+
+### 4. Rodar o Servidor
+Com as dependências instaladas, inicie a API através do ponto de entrada principal:
+
+```bash
+python run.py
+```
+
+A API estará disponível em: `http://127.0.0.1:8000`
+A documentação interativa (Swagger UI) estará em: `http://127.0.0.1:8000/docs`
 
 ---
 
-## 📂 Arquitetura de Armazenamento Local
+## 📖 Endpoints da API
 
-A API não requer serviços externos. Ao rodar a aplicação e realizar os primeiros cadastros, ela criará automaticamente duas pastas na raiz do projeto:
+Abaixo está o resumo das rotas disponíveis. Acesse o `/docs` da aplicação para testar via interface.
 
-* `./chroma_db/`: Contém os arquivos do banco de dados vetorial SQLite/Parquet (Embeddings e Metadados).
-* `./banco_imagens/`:
-    * `/rostos/`: Onde as imagens faciais físicas são salvas de forma persistente.
-    * `/tatuagens/`: Onde as imagens de tatuagens físicas são salvas.
+### 👤 Rotas de Rosto
 
----
+* **`POST /api/cadastrar`**
+    * **Descrição:** Cadastra até 5 imagens faciais de um mesmo usuário.
+    * **Parâmetros (Form-Data):**
+        * `files`: Lista de imagens (jpeg, jpg, png).
+        * `nome`: Nome do usuário (será sanitizado para ser usado como pasta/identificador).
+    
+* **`POST /api/reconhecer`**
+    * **Descrição:** Recebe imagens e busca no ChromaDB qual o rosto cadastrado mais semelhante.
+    * **Parâmetros (Form-Data):**
+        * `files`: Lista de imagens para reconhecimento.
+    * **Regra:** Utiliza *Cosine Distance* com threshold de `0.68` para o modelo ArcFace.
 
-## 📡 Endpoints da API
+### ⚓ Rotas de Tatuagem
 
-Abaixo estão os detalhes de cada rota. Todas as requisições que enviam imagens devem usar o `Content-Type: multipart/form-data`. O limite é de **5 imagens por requisição**. Formatos aceitos: JPG, JPEG e PNG.
+* **`POST /api/cadastrar-tatuagem`**
+    * **Descrição:** Cadastra imagens de tatuagens, extraindo vetores via EfficientNetB0.
+    * **Parâmetros (Form-Data):**
+        * `files`: Lista de imagens (jpeg, jpg, png).
+        * `nome`: Nome ou identificação da pessoa/tatuagem.
 
-### 1. Cadastro de Rosto
-Extrai as características faciais da imagem e as salva no banco vetorial atreladas a um nome.
-
-* **URL:** `/api/cadastrar`
-* **Método:** `POST`
-* **Parâmetros (Form-Data):**
-    * `files` (Array de Arquivos): As imagens contendo os rostos.
-    * `nome` (String): Nome do usuário a ser cadastrado.
-* **Respostas:**
-    * `200 OK`: Retorna um JSON detalhando o status de cada arquivo enviado.
-    * `400 Bad Request`: Se o limite de imagens for excedido ou o nome contiver caracteres inválidos.
-
-### 2. Reconhecimento de Rosto
-Compara a imagem enviada com o banco de dados e retorna o usuário mais próximo (se a similaridade for aceitável).
-
-* **URL:** `/api/reconhecer`
-* **Método:** `POST`
-* **Parâmetros (Form-Data):**
-    * `files` (Array de Arquivos): As imagens a serem reconhecidas.
-* **Limiar (Threshold):** `0.68` (Distância de Cosseno).
-* **Retorno de Sucesso:**
-    ```json
-    {
-      "resultados": [
-        {
-          "arquivo": "foto_camera.jpg",
-          "status": "sucesso",
-          "nome_identificado": "joao_silva",
-          "distancia": 0.3412
-        }
-      ]
-    }
-    ```
-
-### 3. Cadastro de Tatuagem
-Extrai características visuais da tatuagem usando *EfficientNetB0* e salva no banco vetorial.
-
-* **URL:** `/api/cadastrar-tatuagem`
-* **Método:** `POST`
-* **Parâmetros (Form-Data):**
-    * `files` (Array de Arquivos): As imagens das tatuagens.
-    * `nome` (String): Nome do usuário ou identificador da tatuagem.
-* **Respostas:**
-    * `200 OK`: Retorna o status de sucesso para cada imagem cadastrada.
-
-### 4. Reconhecimento de Tatuagem
-Compara a tatuagem enviada com as tatuagens registradas no banco.
-
-* **URL:** `/api/reconhecer-tatuagem`
-* **Método:** `POST`
-* **Parâmetros (Form-Data):**
-    * `files` (Array de Arquivos): As imagens a serem pesquisadas.
-* **Limiar (Threshold):** `0.4` (Distância de Cosseno - pode requerer ajuste fino conforme o dataset em produção).
-* **Retorno de Sucesso:** JSON com o nome identificado e a distância calculada.
+* **`POST /api/reconhecer-tatuagem`**
+    * **Descrição:** Busca tatuagens similares no banco de dados.
+    * **Parâmetros (Form-Data):**
+        * `files`: Lista de imagens para reconhecimento.
+    * **Regra:** Utiliza *Cosine Distance* com threshold ajustado para `0.4`.
 
 ---
 
-## 🧠 Lógica de Limiares (Thresholds) e Distância
+## ⚠️ Observações de Desempenho e Segurança
 
-O sistema utiliza a **Distância de Cosseno (Cosine Distance)** calculada nativamente pelo ChromaDB. 
-* O valor de distância varia de `0.0` a `1.0`. 
-* Quanto **menor** o valor, mais idênticas são as imagens (Ex: `0.0` significa uma correspondência matematicamente perfeita).
-* O valor de corte determina a tolerância a falsos positivos. Valores acima do limiar configurado nas rotas (`0.68` para rostos e `0.4` para tatuagens) retornarão "Sem correspondência", evitando que pessoas erradas sejam aprovadas.
+* **Limpeza de Temporários:** A API utiliza arquivos temporários para processamento, mas garante a deleção automática ao fim de cada request no bloco `finally`.
+* **Sanitização:** Entradas de nome de usuário passam por uma função de *Regex* rigorosa para evitar injeção de caracteres que possam corromper os caminhos do sistema operacional.
+* **Escalabilidade do ChromaDB:** O banco de dados está rodando em modo local persistente (`PersistentClient`). Para deploy em produção com múltiplos containers, considere migrar para o ChromaDB em modo Servidor (Client-Server).
